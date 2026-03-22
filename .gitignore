@@ -1,0 +1,6 @@
+
+rust-harness/target/
+*.o
+src/*.bak
+**/*.bak
+.DS_Store

@@ -1,0 +1,14 @@
+{
+  "kind": "commit",
+  "op": "create",
+  "collection": "app.bsky.feed.post",
+  "seq": 26653242501,
+  "repo": "did:plc:exampleassemblersky000000000000",
+  "rev": "3m-demo-rev",
+  "rkey": "3m-demo-rkey",
+  "record": {
+    "$type": "app.bsky.feed.post",
+    "text": "Hello from Assemblersky milestone 4.",
+    "createdAt": "2026-03-21T12:34:56.000Z"
+  }
+}
