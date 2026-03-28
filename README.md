@@ -1,65 +1,82 @@
 # Assemblersky
 
-An x86-64 assembly decoder engine for Bluesky / AT Protocol firehose frames.
-Part of the Fortransky ecosystem — an alternate `relay-raw` decoder path.
+x86-64 assembly decoding the Bluesky firehose
 
-> Raw binary frames from the AT Protocol relay, decoded in x86-64 assembly.
-> No runtime. No abstractions. Just registers and the protocol.
+CBOR → CAR → DAG-CBOR → post text. No runtime. No abstractions. Just registers
+and the protocol.
+
+Part of the [Fortransky](https://github.com/FormerLab/fortransky) ecosystem —
+an AT Protocol client written in Fortran.
+
+---
+
+## What it does
+
+The AT Protocol relay (`com.atproto.sync.subscribeRepos`) speaks binary
+WebSocket frames. Each frame contains three nested binary formats before you
+reach a post:
+
+```
+Raw WebSocket frame
+  └─ CBOR envelope     {op, t, seq, repo, rev, ops, blocks}
+       └─ CARv1 block store
+            └─ DAG-CBOR record   {$type, text, createdAt, ...}
+```
+
+Assemblersky decodes all of it in x86-64 NASM assembly — four functions,
+four stages, no allocator, no garbage collector, no language runtime:
+
+```
+asb_decode_envelope()     CBOR envelope → seq, repo, rev, ops slice, blocks
+asb_find_create_post_op() ops array → collection, rkey, CID
+asb_car_find_block()      CARv1 → record block bytes
+asb_extract_post_record() DAG-CBOR → $type, text, createdAt
+```
+
+A thin Rust harness wraps the assembly via a C ABI and emits normalized NDJSON —
+the same schema as Fortransky's Rust firehose bridge, so both decoders are
+interchangeable.
 
 ---
 
 ## Architecture
 
 ```
-Raw relay frame (binary CBOR over WebSocket)
-  → asb_decode_envelope()     CBOR envelope → seq, repo, rev, ops slice, blocks slice
-  → asb_find_create_post_op() ops array → collection, rkey, CID
-  → asb_car_find_block()      CARv1 → record block bytes
-  → asb_extract_post_record() DAG-CBOR → $type, text, createdAt
-  → normalized NDJSON
+assemblersky-harness (Rust CLI)
+  └─ ffi.rs           Rust FFI bindings → C ABI
+       └─ assemblersky_exports.c   C glue
+            └─ cbor_scan.asm       asb_decode_envelope
+            └─ car_scan.asm        asb_car_find_block
+            └─ post_extract.asm    asb_find_create_post_op + asb_extract_post_record
+            └─ util.asm            asb_mem_eq
 ```
-
-All four stages are implemented in x86-64 NASM assembly (SysV ABI).
-A thin Rust harness wraps the assembly via a C ABI, calls all four stages
-in sequence, and emits normalized NDJSON — the same schema as the Rust
-`firehose_bridge_cli` in Fortransky, so Fortransky's relay helper accepts
-either decoder transparently.
-
-### Why assembly
-
-The AT Protocol relay speaks `com.atproto.sync.subscribeRepos` — binary
-WebSocket frames containing concatenated CBOR items. Each frame carries a
-header map, a body map, a CARv1 block store, and DAG-CBOR encoded records.
-Three nested binary formats before you see a post.
-
-Assemblersky decodes all of it with no allocator, no garbage collector, and
-no language runtime. Every instruction between the raw frame bytes and the
-output JSON is explicit and auditable. The decode pipeline is a direct
-translation of the AT Protocol wire format into register operations.
 
 ---
 
 ## SysV ABI discipline
 
-The assembly is strict about the x86-64 SysV calling convention:
+The assembly is strict about the x86-64 SysV calling convention. Getting this
+wrong is the main class of bug in assembly code that calls other assembly:
 
-- Callee-save registers (`rbx`, `r12`–`r15`, `rbp`) are pushed on entry
-  and popped on exit for every function.
-- Caller-save registers (`rsi`, `rdi`, `rcx`, `rdx`, `r8`, `r9`, `r10`,
-  `r11`) are reloaded from callee-save registers before every call that
-  needs them — they cannot be assumed to survive across a `call`.
-- `rsi` (end pointer) in particular must be reloaded before every helper
-  call since nearly all helpers use it as a bounds limit.
-- Output pointer arguments passed in `r8`/`r9` are saved to the stack
-  immediately on entry, as `_decode_varint` clobbers both.
+- **Callee-save registers** (`rbx`, `r12`–`r15`, `rbp`) — pushed on entry,
+  popped on exit for every function
+- **Caller-save registers** (`rsi`, `rdi`, `rcx`, `rdx`, `r8`, `r9`) —
+  reloaded from callee-save registers before every call that needs them;
+  cannot be assumed to survive across a `call`
+- **`rsi` (end pointer)** — must be reloaded before every helper call since
+  nearly all helpers use it as a bounds limit
+- **Output pointer arguments** (`r8`, `r9`)** — saved to the stack on entry
+  since `_decode_varint` and similar helpers clobber both
+
+The bring-up debugging session that fixed these is documented in the git history.
 
 ---
 
 ## Build dependencies
 
-- NASM (`sudo apt install nasm`)
-- Rust toolchain (`rustup` or distro package)
-- C compiler (`gcc` or `clang`, pulled in via the `cc` crate)
+- NASM (`sudo apt install nasm` / `sudo pacman -S nasm`)
+- Rust toolchain >= 1.78 (`rustup` or distro package)
+- C compiler (`gcc` or `clang`, via the `cc` crate)
 
 ## Build
 
@@ -101,9 +118,7 @@ Expected output:
 
 ---
 
-## Integration with Fortransky
-
-Copy the built binary into the Fortransky repo:
+## Integrated with Fortransky already, but if you ever accidently delete it  :) 
 
 ```bash
 mkdir -p ../fortransky/bridge/assemblersky/bin
@@ -112,17 +127,15 @@ cp rust-harness/target/release/assemblersky-harness \
 ```
 
 Fortransky's `relay_raw_tail.py` auto-detects `assemblersky_cli` and prefers
-it over the Rust firehose bridge decoder. Detection order:
+it over the Rust firehose bridge. Detection order:
 
 1. `FORTRANSKY_RELAY_DECODER` env var
 2. `FORTRANSKY_ASSEMBLERSKY_DECODER` env var
 3. `bridge/assemblersky/bin/assemblersky_cli` (bundled)
 4. `assemblersky_cli` on `PATH`
-5. Rust `firehose_bridge_cli` (fallback)
+5. Rust `firehose_bridge_cli` fallback
 
-To verify which decoder is active, check `~/.fortransky/relay_raw_tail.out`
-after a stream refresh — events decoded by Assemblersky carry
-`"source": "relay-raw-native"` from the Rust harness output.
+Check detection: `./scripts/check_assemblersky.sh`
 
 ---
 
@@ -135,8 +148,7 @@ after a stream refresh — events decoded by Assemblersky carry
 - Linux x86-64 only (SysV ABI)
 
 The CID in commit ops is captured as raw bytes — no semantic CID decode.
-The CAR block scanner uses a heuristic varint walk to determine CID length
-rather than a full multicodec parse.
+The CAR block scanner uses a heuristic varint walk to determine CID length.
 
 ---
 
@@ -144,41 +156,39 @@ rather than a full multicodec parse.
 
 ```
 asm/
-  cbor_scan.asm        asb_decode_envelope — CBOR envelope + body map parser
-  car_scan.asm         asb_car_find_block  — CARv1 varint scanner + CID match
-  post_extract.asm     asb_find_create_post_op + asb_extract_post_record
-  util.asm             asb_mem_eq          — bounded memory compare
+  cbor_scan.asm      asb_decode_envelope — CBOR envelope + body map parser
+  car_scan.asm       asb_car_find_block  — CARv1 varint scanner + CID match
+  post_extract.asm   asb_find_create_post_op + asb_extract_post_record
+  util.asm           asb_mem_eq — bounded memory compare
 
 include/
-  assemblersky.h       C ABI header — struct definitions + function prototypes
+  assemblersky.h     C ABI header — struct definitions + function prototypes
 
 cshim/
-  assemblersky_exports.c   C-visible glue declarations (no logic)
+  assemblersky_exports.c   C-visible glue (no logic)
 
 rust-harness/
-  src/main.rs          CLI entry point — calls all 4 stages, emits NDJSON
-  src/ffi.rs           Rust FFI bindings to the assembly functions
-  src/normalize.rs     NormalizedEvent + NormalizedRecord output structs
-  build.rs             Compiles NASM sources + C shim via cc crate
+  src/main.rs        CLI entry point — calls all 4 stages, emits NDJSON
+  src/ffi.rs         Rust FFI bindings
+  src/normalize.rs   NormalizedEvent + NormalizedRecord output structs
+  build.rs           Compiles NASM + C shim via cc crate
   Cargo.toml
 
 tests/
   fixtures/relay_commit_frame.bin    Synthetic raw #commit relay frame
-  expected/relay_commit_frame.json   Expected normalized output shape
+  expected/relay_commit_frame.json   Expected normalized output
 ```
 
 ---
 
 ## Part of the Former Lab ecosystem
 
-Assemblersky is part of [Fortransky](https://github.com/FormerLab/fortransky) —
-a Bluesky client written in Fortran. The decode pipeline:
-
 ```
-Fortran TUI
-  └─ Python relay helper
-       └─ assemblersky_cli  (this project)
-            └─ x86-64 assembly  →  Rust harness  →  NDJSON
+Fortransky  (Fortran TUI Bluesky client)
+  └─ relay_raw_tail.py
+       └─ assemblersky-harness   ← this project
+            └─ x86-64 NASM assembly
 ```
 
-Former Lab: [formerlab.bsky.social](https://bsky.app/profile/formerlab.bsky.social)
+Fortransky: https://github.com/FormerLab/fortransky
+Former Lab: https://bsky.app/profile/formerlab.bsky.social
