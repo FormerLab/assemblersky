@@ -39,6 +39,10 @@ interchangeable.
 
 ---
 
+![Assemblersky decoding a live AT Protocol firehose frame](assets/assemblersky-decode.png)
+
+---
+
 ## Architecture
 
 ```
