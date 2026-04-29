@@ -1,5 +1,7 @@
 # Assemblersky
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
 x86-64 assembly decoding the Bluesky firehose
 
 CBOR → CAR → DAG-CBOR → post text. No runtime. No abstractions. Just registers
