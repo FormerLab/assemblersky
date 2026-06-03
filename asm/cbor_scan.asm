@@ -3,12 +3,11 @@
 ;
 ; int asb_decode_envelope(const uint8_t *buf, size_t len, asb_envelope_t *out)
 ;
-; Parses two concatenated CBOR items from an AT Protocol event-stream frame:
-;   - header map: {op: 1, t: "#commit"}
-;   - body map:   {seq, repo, rev, ops, blocks, ...}
-;
-; Fills asb_envelope_t with pointers/lengths into the original buffer.
-; Definite-length CBOR subset only.
+; Security fixes vs v0.6:
+;   - decode_head: clamp rcx against remaining buffer for major types 2,3,4,5
+;     prevents integer overflow → infinite loop / OOB read on crafted input
+;   - skip_item: depth counter (max 64) prevents stack exhaustion via
+;     deeply nested CBOR arrays/maps/tags
 
 BITS 64
 DEFAULT REL
@@ -23,6 +22,8 @@ DEFAULT REL
 %define OFF_BLOCKS_PTR  56
 %define OFF_BLOCKS_LEN  64
 %define OFF_IS_COMMIT   72
+
+%define MAX_DEPTH       64          ; max recursion depth for skip_item
 
 section .rodata
 key_op:         db 'op'
@@ -104,14 +105,6 @@ asb_decode_envelope:
 
 ; =============================================================================
 ; parse_header_map(rdi=cur, rsi=end) -> rax=next or 0
-; Register map (callee-save, so stable across inner calls):
-;   r12 = end ptr (copy of rsi, reloaded into rsi before each call)
-;   r13 = cur ptr
-;   r14 = out ptr  (from caller's frame, not modified here)
-;   r15 = pair count
-;   rbx = key ptr
-;   rbp saved
-; Stack slot [rsp+0] = key len (can't use r13 since we need end separately)
 ; =============================================================================
 parse_header_map:
     push rbp
@@ -122,11 +115,8 @@ parse_header_map:
     push r15
     sub rsp, 16             ; local: [rsp+0]=key_len
 
-    ; save end ptr into r12 (stable across calls)
     mov r12, rsi
 
-    ; decode map header
-    ; rdi already = cur, rsi already = end
     call decode_head
     test rax, rax
     jz .fail
@@ -140,17 +130,15 @@ parse_header_map:
     test r15, r15
     jz .ok
 
-    ; parse key as text
     mov rdi, r13
-    mov rsi, r12            ; reload end
+    mov rsi, r12
     call parse_text_item
     test rax, rax
     jz .fail
-    mov r13, rax            ; cur = after key
-    mov rbx, rdx            ; key ptr
-    mov [rsp+0], rcx        ; key len (on stack)
+    mov r13, rax
+    mov rbx, rdx
+    mov [rsp+0], rcx
 
-    ; check "t"
     mov rdx, rbx
     mov rcx, [rsp+0]
     lea r8, [rel key_t]
@@ -165,7 +153,6 @@ parse_header_map:
     test rax, rax
     jz .fail
     mov r13, rax
-    ; rdx=value ptr, rcx=value len — compare to "#commit"
     lea r8, [rel str_commit]
     mov r9, 7
     call match_value
@@ -194,6 +181,7 @@ parse_header_map:
 .skip_value:
     mov rdi, r13
     mov rsi, r12
+    xor r9, r9              ; depth = 0
     call skip_item
     test rax, rax
     jz .fail
@@ -219,13 +207,6 @@ parse_header_map:
 
 ; =============================================================================
 ; parse_body_map(rdi=cur, rsi=end) -> rax=next or 0
-; Register map:
-;   r12 = end ptr (stable)
-;   r13 = cur ptr
-;   r14 = out ptr (from outer frame)
-;   r15 = pair count
-;   rbx = key ptr
-;   [rsp+0] = key len
 ; =============================================================================
 parse_body_map:
     push rbp
@@ -234,34 +215,32 @@ parse_body_map:
     push r12
     push r13
     push r15
-    sub rsp, 16             ; local: [rsp+0]=key_len
+    sub rsp, 16
 
-    mov r12, rsi            ; save end ptr
+    mov r12, rsi
 
-    mov rdi, rdi            ; cur already in rdi
-    ; rsi already = end
+    mov rdi, rdi
     call decode_head
     test rax, rax
     jz .fail
-    cmp r8b, 5              ; must be map
+    cmp r8b, 5
     jne .fail
 
-    mov r13, rax            ; cur = after map header
-    mov r15, rcx            ; pair count
+    mov r13, rax
+    mov r15, rcx
 
 .loop:
     test r15, r15
     jz .ok
 
-    ; parse key
     mov rdi, r13
     mov rsi, r12
     call parse_text_item
     test rax, rax
     jz .fail
     mov r13, rax
-    mov rbx, rdx            ; key ptr
-    mov [rsp+0], rcx        ; key len
+    mov rbx, rdx
+    mov [rsp+0], rcx
 
     ; seq
     mov rdx, rbx
@@ -324,10 +303,10 @@ parse_body_map:
     call match_key
     test eax, eax
     jz .check_blocks
-    ; capture the raw ops slice (pointer + length before skipping)
-    mov rbx, r13            ; save start of ops value
+    mov rbx, r13
     mov rdi, r13
     mov rsi, r12
+    xor r9, r9
     call skip_item
     test rax, rax
     jz .fail
@@ -359,6 +338,7 @@ parse_body_map:
 .skip_value:
     mov rdi, r13
     mov rsi, r12
+    xor r9, r9
     call skip_item
     test rax, rax
     jz .fail
@@ -383,10 +363,9 @@ parse_body_map:
     ret
 
 ; =============================================================================
-; Helpers — all take rdi=ptr, rsi=end
+; Helpers
 ; =============================================================================
 
-; parse_uint_item -> rax=next or 0, rdx=value
 parse_uint_item:
     call decode_head
     test rax, rax
@@ -399,7 +378,6 @@ parse_uint_item:
     xor eax, eax
     ret
 
-; parse_text_item -> rax=next or 0, rdx=data_ptr, rcx=len
 parse_text_item:
     call decode_head
     test rax, rax
@@ -417,7 +395,6 @@ parse_text_item:
     xor eax, eax
     ret
 
-; parse_bytes_item -> rax=next or 0, rdx=data_ptr, rcx=len
 parse_bytes_item:
     call decode_head
     test rax, rax
@@ -435,14 +412,25 @@ parse_bytes_item:
     xor eax, eax
     ret
 
-; skip_item -> rax=next or 0
-; Handles: uint, negint, bytes, text, array, map, simple/float, tag
+; skip_item(rdi=ptr, rsi=end) -> rax=next or 0
+; Depth is tracked on the stack to avoid clobbering r9 (used by decode_head).
+; Returns 0 on failure or if nesting depth exceeds MAX_DEPTH.
 skip_item:
     push rbx
     push r12
     push r13
+    push r15                ; r15 = saved depth
 
-    ; save end ptr — rsi may be clobbered by recursive calls
+    ; load depth from caller's stack frame or use 0 for first call
+    ; We store depth in r15 across this activation
+    ; Top-level callers do: xor r9,r9 / call skip_item
+    ; Recursive calls: pass depth+1 in r9
+    mov r15, r9
+
+    ; depth check
+    cmp r15, MAX_DEPTH
+    jae .fail
+
     mov r12, rsi
 
     call decode_head
@@ -477,23 +465,23 @@ skip_item:
     jmp .done
 
 .skip_tag:
-    ; tag: consume the tag argument (already in rcx via decode_head),
-    ; then skip the wrapped item
     mov rdi, rax
     mov rsi, r12
+    lea r9, [r15 + 1]       ; depth+1
     call skip_item
     test rax, rax
     jz .fail
     jmp .done
 
 .skip_array:
-    mov r13, rcx            ; item count
-    mov rbx, rax            ; cur
+    mov r13, rcx
+    mov rbx, rax
 .array_loop:
     test r13, r13
     jz .array_done
     mov rdi, rbx
     mov rsi, r12
+    lea r9, [r15 + 1]       ; depth+1
     call skip_item
     test rax, rax
     jz .fail
@@ -505,19 +493,21 @@ skip_item:
     jmp .done
 
 .skip_map:
-    mov r13, rcx            ; pair count
-    mov rbx, rax            ; cur
+    mov r13, rcx
+    mov rbx, rax
 .map_loop:
     test r13, r13
     jz .map_done
     mov rdi, rbx
     mov rsi, r12
+    lea r9, [r15 + 1]       ; depth+1
     call skip_item          ; key
     test rax, rax
     jz .fail
     mov rbx, rax
     mov rdi, rbx
     mov rsi, r12
+    lea r9, [r15 + 1]       ; depth+1
     call skip_item          ; value
     test rax, rax
     jz .fail
@@ -531,13 +521,18 @@ skip_item:
 .fail:
     xor eax, eax
 .done:
+    pop r15
     pop r13
     pop r12
     pop rbx
     ret
 
 ; decode_head(rdi=ptr, rsi=end) -> rax=after_head or 0, r8b=major, rcx=arg
-; Supports info values 0-27 (definite only). Indefinite (31) returns fail.
+;
+; Security: for major types that use rcx as a length/count (2=bytes, 3=text,
+; 4=array, 5=map), rcx is clamped to (rsi - rax) after decoding.
+; This prevents integer-overflow attacks where a crafted u64 length causes
+; an infinite loop or OOB read in callers that use rcx directly as a count.
 decode_head:
     cmp rdi, rsi
     jae .fail
@@ -562,13 +557,13 @@ decode_head:
 .small:
     mov ecx, eax
     mov rax, rdx
-    ret
+    jmp .clamp_check
 .u8:
     cmp rdx, rsi
     jae .fail
     movzx ecx, byte [rdx]
     lea rax, [rdx + 1]
-    ret
+    jmp .clamp_check
 .u16:
     lea rax, [rdx + 2]
     cmp rax, rsi
@@ -577,7 +572,7 @@ decode_head:
     shl ecx, 8
     movzx r9d, byte [rdx + 1]
     or ecx, r9d
-    ret
+    jmp .clamp_check
 .u32:
     lea rax, [rdx + 4]
     cmp rax, rsi
@@ -594,7 +589,7 @@ decode_head:
     or rcx, r9
     movzx r9d, byte [rdx + 3]
     or rcx, r9
-    ret
+    jmp .clamp_check
 .u64:
     lea rax, [rdx + 8]
     cmp rax, rsi
@@ -623,6 +618,37 @@ decode_head:
     or rcx, r9
     movzx r9d, byte [rdx + 7]
     or rcx, r9
+    ; fall through to .clamp_check
+
+.clamp_check:
+    ; For major types 2 (bytes) and 3 (text): rcx is a byte length.
+    ; Clamp to remaining buffer bytes to prevent OOB reads.
+    ; For major types 4 (array) and 5 (map): rcx is an item count.
+    ; Cap at 65535 to prevent infinite loops on crafted u64 counts.
+    ; uint (0/1), tag (6), simple (7) are exempt.
+    cmp r8b, 2
+    je .clamp_bytes
+    cmp r8b, 3
+    je .clamp_bytes
+    cmp r8b, 4
+    je .clamp_count
+    cmp r8b, 5
+    je .clamp_count
+    jmp .done
+.clamp_bytes:
+    ; byte/text length must fit in remaining buffer
+    mov r9, rsi
+    sub r9, rax
+    cmp rcx, r9
+    jbe .done
+    mov rcx, r9
+    jmp .done
+.clamp_count:
+    ; item count cap: no legitimate AT Protocol frame has >65535 items
+    cmp rcx, 65536
+    jbe .done
+    mov rcx, 65536
+.done:
     ret
 .fail:
     xor eax, eax

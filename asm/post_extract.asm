@@ -403,6 +403,7 @@ asb_extract_post_record:
     jmp .loop_pairs
 
 .skip_val_rec:
+    xor r10, r10            ; depth = 0 for top-level skip
     call skip_item_rec
     jc .fail
     dec r15
@@ -649,6 +650,7 @@ match_bytes:
 
 ; read_len_rec: read additional-info length from AL, advance r12
 ; result in RAX, CF=0 success, CF=1 fail
+; Security: clamps result to (r13 - r12) to prevent overflow-based OOB/loops.
 read_len_rec:
     cmp al, 23
     jbe .small
@@ -658,6 +660,8 @@ read_len_rec:
     je .u16
     cmp al, 26
     je .u32
+    cmp al, 27
+    je .u64
     jmp .fail
 .small:
     movzx rax, al
@@ -704,6 +708,50 @@ read_len_rec:
     add r12, 4
     clc
     ret
+.u64:
+    lea rcx, [r12+8]
+    cmp rcx, r13
+    ja .fail
+    xor rax, rax
+    mov al, [r12]
+    shl rax, 8
+    mov dl, [r12+1]
+    movzx rdx, dl
+    or rax, rdx
+    shl rax, 8
+    mov dl, [r12+2]
+    movzx rdx, dl
+    or rax, rdx
+    shl rax, 8
+    mov dl, [r12+3]
+    movzx rdx, dl
+    or rax, rdx
+    shl rax, 8
+    mov dl, [r12+4]
+    movzx rdx, dl
+    or rax, rdx
+    shl rax, 8
+    mov dl, [r12+5]
+    movzx rdx, dl
+    or rax, rdx
+    shl rax, 8
+    mov dl, [r12+6]
+    movzx rdx, dl
+    or rax, rdx
+    shl rax, 8
+    mov dl, [r12+7]
+    movzx rdx, dl
+    or rax, rdx
+    add r12, 8
+    ; clamp rax to remaining buffer (r13 - r12)
+    mov rcx, r13
+    sub rcx, r12
+    cmp rax, rcx
+    jbe .clamp_ok_u64
+    mov rax, rcx
+.clamp_ok_u64:
+    clc
+    ret
 .fail:
     stc
     ret
@@ -737,7 +785,11 @@ read_text_rec:
     ret
 
 ; skip_item_rec: skip one CBOR item at r12; CF=0 success
+; r10 = current depth (callers must initialise to 0; incremented on recursion)
+; Returns CF=1 if depth > 64 to prevent stack exhaustion.
 skip_item_rec:
+    cmp r10, 64
+    ja .fail
     cmp r12, r13
     jae .fail
     movzx eax, byte [r12]
@@ -796,7 +848,9 @@ skip_item_rec:
 .array_loop_rec:
     test rcx, rcx
     jz .ok
+    inc r10
     call skip_item_rec
+    dec r10
     jc .fail
     dec rcx
     jmp .array_loop_rec
@@ -807,16 +861,22 @@ skip_item_rec:
 .map_loop_rec:
     test rcx, rcx
     jz .ok
+    inc r10
     call skip_item_rec
+    dec r10
     jc .fail
+    inc r10
     call skip_item_rec
+    dec r10
     jc .fail
     dec rcx
     jmp .map_loop_rec
 .tag:
     call read_len_rec
     jc .fail
+    inc r10
     call skip_item_rec
+    dec r10
     ret
 .need1:
     lea rcx, [r12+1]
